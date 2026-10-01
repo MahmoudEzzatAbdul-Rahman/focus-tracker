@@ -6,12 +6,13 @@ import OSLog
 import QuartzCore
 
 /// Wires the pipeline together: camera → features → gaze point → target window → highlight,
-/// and focuses the target when the hotkey is tapped.
+/// focuses the target when the hotkey is tapped, and learns from the user's clicks.
 @MainActor
 final class FocusCoordinator {
     let settings: Settings
 
-    private(set) var calibration: CalibrationRecord?
+    /// What has been learned about the user's gaze; starts from population defaults.
+    private(set) var learning = SelfCalibration()
     private(set) var target: WindowInfo?
     private(set) var isCameraAuthorized = false
     var isCalibrating: Bool { calibrationController != nil }
@@ -22,31 +23,50 @@ final class FocusCoordinator {
     private let locator = WindowLocator()
     private let focuser = WindowFocuser()
     private let hotkey = HotkeyMonitor()
+    private let clicks = ClickMonitor()
     private let overlay = HighlightOverlay()
     private var debugWindow: DebugWindowController?
     private var calibrationController: CalibrationController?
 
-    private var filter = PointFilter()
+    private var geometry = ScreenGeometry.gazeGeometry
+    private var stabilizer = GazeStabilizer(radius: 0)
+    private var blinkDetector = BlinkDetector()
+    private var medianFilter = FeatureMedianFilter()
     private var selector = TargetSelector()
     private var dwellTrigger = DwellTrigger(delay: 0.8)
     private var latestFeatures: GazeFeatures?
     private var latestFeaturesTime: TimeInterval = -.infinity
+    /// Recent non-blink features, for averaging over the moment of a click.
+    private var recentFeatures: [(time: TimeInterval, features: GazeFeatures)] = []
     private var gazePoint: CGPoint?
     private var windows: [WindowInfo] = []
     private var windowsRefreshedAt: TimeInterval = -.infinity
     private var tickTimer: Timer?
     private var trustTimer: Timer?
+    private var unsavedSamples = 0
 
     /// Features older than this count as "no face".
     private let featureMaxAge: TimeInterval = 0.3
     private let windowRefreshInterval: TimeInterval = 0.25
+    /// Features from this long before a click are averaged into its sample.
+    private let clickFeatureWindow: TimeInterval = 0.15
+    /// The profile is saved after this many new samples (and on quit).
+    private let samplesPerSave = 10
+    /// Fixation radius as a fraction of the screen diagonal.
+    private let fixationRadiusFraction = 0.035
 
     init(settings: Settings) {
         self.settings = settings
     }
 
     func start() {
-        calibration = CalibrationStore.load()
+        learning = GazeProfileStore.load() ?? SelfCalibration()
+        refreshGeometry()
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshGeometry() }
+        }
 
         let extractor = FaceFeatureExtractor()
         camera.onFrame = { [weak self] pixelBuffer in
@@ -58,6 +78,7 @@ final class FocusCoordinator {
         }
 
         hotkey.onTap = { [weak self] in self?.focusTarget() }
+        clicks.onClick = { [weak self] location in self?.learn(fromClickAt: location) }
         requestAccessibility()
         requestCamera()
 
@@ -87,6 +108,22 @@ final class FocusCoordinator {
         settings.dwellDelay = delay
     }
 
+    func setLearnsFromClicks(_ learns: Bool) {
+        settings.learnsFromClicks = learns
+    }
+
+    /// Forgets everything learned from clicks and calibration, going back to the defaults.
+    func resetLearning() {
+        learning.reset()
+        stabilizer.reset()
+        saveProfile()
+    }
+
+    func saveProfile() {
+        GazeProfileStore.save(learning)
+        unsavedSamples = 0
+    }
+
     func selectCamera(id: String) {
         settings.cameraID = id
         if isCameraAuthorized { camera.start(deviceID: id) }
@@ -101,14 +138,17 @@ final class FocusCoordinator {
 
         camera.start(deviceID: settings.cameraID)
         overlay.hide()
-        let controller = CalibrationController()
-        controller.onFinish = { [weak self] record in
+        let controller = CalibrationController(geometry: geometry) { [learning, geometry] samples in
+            learning.fitted(adding: samples, geometry: geometry)
+        }
+        controller.onFinish = { [weak self] result in
             guard let self else { return }
             calibrationController = nil
-            if let record {
-                calibration = record
-                CalibrationStore.save(record)
-                filter.reset()
+            if let result {
+                learning.add(contentsOf: result.samples, geometry: geometry)
+                learning.record(errors: result.validationErrors)
+                saveProfile()
+                stabilizer.reset()
             }
             updateCameraState()
         }
@@ -130,10 +170,14 @@ final class FocusCoordinator {
     // MARK: Pipeline
 
     private func ingest(_ features: GazeFeatures?, at time: TimeInterval) {
-        guard let features else { return }
-        latestFeatures = features
+        // Blink frames are dropped: the pupil landmarks jump while the eyes are closed.
+        guard let features, !blinkDetector.isBlinking(openness: features.eyeOpenness) else { return }
+        let smoothed = medianFilter.filter(features)
+        latestFeatures = smoothed
         latestFeaturesTime = time
-        calibrationController?.ingest(features)
+        recentFeatures.append((time, smoothed))
+        recentFeatures.removeAll { time - $0.time > 1 }
+        calibrationController?.ingest(smoothed)
     }
 
     private func tick() {
@@ -174,13 +218,44 @@ final class FocusCoordinator {
         if settings.usesMouseAsGaze {
             return CGEvent(source: nil)?.location
         }
-        guard let model = calibration?.model, let latestFeatures, now - latestFeaturesTime < featureMaxAge else {
-            filter.reset()
+        guard let latestFeatures, now - latestFeaturesTime < featureMaxAge else {
+            stabilizer.reset()
+            medianFilter.reset()
             return nil
         }
-        // Filter on the frame's own timestamp: ticks between frames then leave the filter untouched.
-        let smoothed = filter.filter(model.predict(latestFeatures), at: latestFeaturesTime)
-        return smoothed.clamped(to: ScreenGeometry.mainDisplayBounds)
+        guard let predicted = learning.model.predict(latestFeatures, geometry: geometry) else { return nil }
+        // Stabilize on the frame's own timestamp: ticks between frames then leave the stabilizer untouched.
+        let stabilized = stabilizer.update(predicted.clamped(to: geometry.screenFrame), at: latestFeaturesTime)
+        return stabilized.clamped(to: geometry.screenFrame)
+    }
+
+    private func refreshGeometry() {
+        geometry = ScreenGeometry.gazeGeometry
+        let diagonal = Double(hypot(geometry.screenFrame.width, geometry.screenFrame.height))
+        stabilizer = GazeStabilizer(radius: diagonal * fixationRadiusFraction)
+    }
+
+    /// Treats a click as a calibration sample: the user was almost certainly looking at it.
+    private func learn(fromClickAt location: CGPoint) {
+        guard
+            settings.isEnabled, settings.learnsFromClicks, !settings.usesMouseAsGaze, calibrationController == nil,
+            geometry.screenFrame.contains(location)
+        else { return }
+        let now = CACurrentMediaTime()
+        let recent = recentFeatures.filter { now - $0.time <= clickFeatureWindow }.map(\.features)
+        guard let features = GazeFeatures.mean(of: recent) else { return }
+
+        let outcome = learning.add(click: GazeSample(features: features, screenPoint: location), geometry: geometry)
+        switch outcome {
+        case .accepted(let error):
+            Logger.calibration.debug("Learned from click, error \(error, format: .fixed(precision: 0)) pt")
+            unsavedSamples += 1
+            if unsavedSamples >= samplesPerSave { saveProfile() }
+        case .rejected(let error):
+            Logger.calibration.debug("Ignored click \(error, format: .fixed(precision: 0)) pt from the gaze")
+        case .unusable:
+            break
+        }
     }
 
     private func focusTarget() {
@@ -206,6 +281,7 @@ final class FocusCoordinator {
         let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
         if AXIsProcessTrustedWithOptions(options) {
             hotkey.start()
+            clicks.start()
             return
         }
         // Global key monitors registered before trust is granted never receive events,
@@ -216,6 +292,7 @@ final class FocusCoordinator {
                 self.trustTimer?.invalidate()
                 self.trustTimer = nil
                 self.hotkey.start()
+                self.clicks.start()
                 Logger.app.info("Accessibility access granted")
             }
         }
@@ -250,6 +327,7 @@ final class FocusCoordinator {
             camera.stop()
             latestFeatures = nil
             latestFeaturesTime = -.infinity
+            recentFeatures.removeAll()
         }
     }
 
@@ -259,20 +337,29 @@ final class FocusCoordinator {
         guard let debugWindow, debugWindow.isVisible else { return }
         var lines: [String] = []
         if let f = latestFeatures, isFaceDetected {
-            lines.append(String(format: "yaw %+.3f  pitch %+.3f  roll %+.3f", f.yaw, f.pitch, f.roll))
+            lines.append(String(format: "yaw %+.3f  pitch %+.3f  roll %+.3f  eyes open %.2f", f.yaw, f.pitch, f.roll, f.eyeOpenness))
             lines.append(String(format: "pupil x %+.2f  y %+.2f", f.pupilX, f.pupilY))
-            lines.append(String(format: "face  x %.2f  y %.2f  size %.2f", f.faceX, f.faceY, f.faceSize))
+            if let head = geometry.headPosition(f) {
+                let angles = learning.model.angles(f, head: head)
+                lines.append(String(format: "head  %+.0f cm right  %+.0f cm below camera  %.0f cm away",
+                                    head.x / 10, head.y / 10, head.distance / 10))
+                lines.append(String(format: "gaze angle  %+.1f° right  %+.1f° down",
+                                    angles.horizontal * 180 / .pi, angles.vertical * 180 / .pi))
+            }
         } else {
             lines.append("No face detected")
         }
         if let gazePoint {
-            lines.append(String(format: "gaze  (%.0f, %.0f)", gazePoint.x, gazePoint.y))
-        }
-        lines.append("target \(target?.ownerName ?? "—")")
-        if let calibration {
-            lines.append(String(format: "calibration error %.0f pt", calibration.meanError))
+            lines.append(String(format: "gaze  (%.0f, %.0f)   target %@", gazePoint.x, gazePoint.y, target?.ownerName ?? "—"))
         } else {
-            lines.append("not calibrated")
+            lines.append("target \(target?.ownerName ?? "—")")
+        }
+        if learning.samples.isEmpty {
+            lines.append("using defaults — click around or Quick Calibrate")
+        } else if let error = learning.typicalError {
+            lines.append(String(format: "learned from %d samples, typical error %.0f pt", learning.samples.count, error))
+        } else {
+            lines.append("learned from \(learning.samples.count) samples")
         }
         debugWindow.update(text: lines.joined(separator: "\n"))
     }

@@ -20,8 +20,8 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         let settings = coordinator.settings
 
         menu.addItem(disabled(statusLine))
-        if let calibration = coordinator.calibration {
-            menu.addItem(disabled(String(format: "Calibration error: %.0f pt", calibration.meanError)))
+        if !settings.usesMouseAsGaze {
+            menu.addItem(disabled(accuracyLine))
         }
         if !coordinator.isAccessibilityTrusted {
             menu.addItem(action("Grant Accessibility Access…") { [coordinator] in
@@ -39,8 +39,14 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             coordinator.setEnabled(!settings.isEnabled)
         })
         menu.addItem(focusModeMenu())
-        menu.addItem(action(coordinator.calibration == nil ? "Calibrate…" : "Recalibrate…") { [coordinator] in
+        menu.addItem(toggle("Learn from Clicks", isOn: settings.learnsFromClicks) { [coordinator] in
+            coordinator.setLearnsFromClicks(!settings.learnsFromClicks)
+        })
+        menu.addItem(action("Quick Calibrate…") { [coordinator] in
             coordinator.startCalibration()
+        })
+        menu.addItem(action("Reset Learning") { [coordinator] in
+            coordinator.resetLearning()
         })
         menu.addItem(cameraMenu())
         menu.addItem(.separator())
@@ -64,16 +70,22 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         let settings = coordinator.settings
         if !settings.isEnabled { return "Paused" }
         if coordinator.isCalibrating { return "Calibrating…" }
-        if !settings.usesMouseAsGaze {
-            if coordinator.calibration == nil { return "Not calibrated" }
-            if !coordinator.isFaceDetected { return "No face detected" }
-        }
+        if !settings.usesMouseAsGaze, !coordinator.isFaceDetected { return "No face detected" }
         if let target = coordinator.target {
             return settings.focusMode == .hotkey
                 ? "Looking at \(target.ownerName) — tap left ⌃ to focus"
                 : "Looking at \(target.ownerName)"
         }
         return "Tracking"
+    }
+
+    private var accuracyLine: String {
+        let learning = coordinator.learning
+        if learning.samples.isEmpty { return "Using default gaze model" }
+        if let error = learning.typicalError {
+            return String(format: "Accuracy ≈ %.0f pt (%d samples)", error, learning.samples.count)
+        }
+        return "Learning… (\(learning.samples.count) samples)"
     }
 
     private func focusModeMenu() -> NSMenuItem {

@@ -49,8 +49,9 @@ final class CameraFeed: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, 
                 output.setSampleBufferDelegate(self, queue: frameQueue)
                 if session.canAddOutput(output) { session.addOutput(output) }
             }
-            if session.canSetSessionPreset(.vga640x480) {
-                session.sessionPreset = .vga640x480
+            // 720p roughly doubles the pixels across each eye compared to VGA, which steadies the pupil offset.
+            if let preset = [AVCaptureSession.Preset.hd1280x720, .vga640x480].first(where: session.canSetSessionPreset) {
+                session.sessionPreset = preset
             }
             session.commitConfiguration()
 
