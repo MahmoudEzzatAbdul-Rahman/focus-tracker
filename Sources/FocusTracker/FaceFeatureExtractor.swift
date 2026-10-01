@@ -14,12 +14,21 @@ final class FaceFeatureExtractor: Sendable {
     /// - Parameter pixelBuffer: An upright, unmirrored camera frame.
     /// - Returns: The features, or `nil` when no face (or no eyes) could be measured reliably.
     func extract(from pixelBuffer: CVPixelBuffer) -> GazeFeatures? {
+        // Only the face rectangles request measures head pose; a landmarks request on its own
+        // reports yaw and roll as 0 and pitch as nil. Landmarks run on the detected faces keep
+        // the pose.
+        let faces = VNDetectFaceRectanglesRequest()
+        faces.revision = VNDetectFaceRectanglesRequestRevision3
         let request = VNDetectFaceLandmarksRequest()
         request.revision = VNDetectFaceLandmarksRequestRevision3
         // More points along each eye give a steadier eye box for the pupil offset.
         request.constellation = .constellation76Points
         do {
-            try VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up).perform([request])
+            let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up)
+            try handler.perform([faces])
+            guard let detected = faces.results, !detected.isEmpty else { return nil }
+            request.inputFaceObservations = detected
+            try handler.perform([request])
         } catch {
             Logger.camera.error("Face detection failed: \(error.localizedDescription, privacy: .public)")
             return nil

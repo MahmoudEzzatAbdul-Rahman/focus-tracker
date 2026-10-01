@@ -33,7 +33,11 @@ public struct SelfCalibration: Sendable, Codable, Equatable {
     /// Never reject a click closer than this to the predicted gaze, in points.
     public static let minimumRejectionDistance = 250.0
     public static let recentErrorCount = 30
+    /// Bumped whenever stored samples stop being comparable with new ones, so old profiles are discarded.
+    /// Version 2: head pose is measured; earlier samples had yaw, pitch and roll stuck at 0.
+    public static let currentFormatVersion = 2
 
+    public private(set) var formatVersion = SelfCalibration.currentFormatVersion
     public private(set) var samples: [StoredSample] = []
     public private(set) var model: GazeModel = .prior
     /// Distances in points between predicted gaze and recent clicks, before learning from them.

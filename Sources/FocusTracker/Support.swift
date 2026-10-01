@@ -87,9 +87,20 @@ enum GazeProfileStore {
             .appending(path: "gaze-profile.json")
     }
 
+    /// Just enough of a stored profile to tell which format it was saved in.
+    private struct Header: Decodable {
+        var formatVersion: Int?
+    }
+
     static func load() -> SelfCalibration? {
         do {
-            return try JSONDecoder().decode(SelfCalibration.self, from: Data(contentsOf: fileURL))
+            let data = try Data(contentsOf: fileURL)
+            let version = try JSONDecoder().decode(Header.self, from: data).formatVersion ?? 1
+            guard version == SelfCalibration.currentFormatVersion else {
+                Logger.calibration.info("Discarding gaze profile saved in format \(version); starting from the defaults")
+                return nil
+            }
+            return try JSONDecoder().decode(SelfCalibration.self, from: data)
         } catch CocoaError.fileReadNoSuchFile {
             return nil
         } catch {

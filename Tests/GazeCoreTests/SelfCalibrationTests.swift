@@ -127,8 +127,11 @@ struct SelfCalibrationTests {
         calibration.add(contentsOf: (0..<10).map { _ in SyntheticUser.typical.randomSample(head: seat, using: &rng) }, geometry: testGeometry)
         calibration.record(errors: [1, 2, 3])
 
-        let decoded = try JSONDecoder().decode(SelfCalibration.self, from: JSONEncoder().encode(calibration))
+        let encoded = try JSONEncoder().encode(calibration)
+        let decoded = try JSONDecoder().decode(SelfCalibration.self, from: encoded)
         #expect(decoded == calibration)
+        let stored = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        #expect(stored["formatVersion"] as? Int == SelfCalibration.currentFormatVersion)
 
         calibration.reset()
         #expect(calibration.samples.isEmpty)

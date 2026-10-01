@@ -74,8 +74,9 @@ Menu items:
 
 ```
 Camera (AVFoundation, 1280×720)
-  → FaceFeatureExtractor   Vision face landmarks (76 points): head yaw/pitch/roll, pupil position
-                           inside each eye, pupil midpoint and distance in the image, eye openness
+  → FaceFeatureExtractor   Vision face rectangles (head yaw/pitch/roll), then face landmarks
+                           (76 points) on those faces: pupil position inside each eye, pupil
+                           midpoint and distance in the image, eye openness
   → BlinkDetector          drops frames taken mid-blink, when the pupil landmarks jump
   → FeatureMedianFilter    3-frame median: removes single-frame spikes
   → GazeGeometry           head position in mm from the pupil distance and position in the image
