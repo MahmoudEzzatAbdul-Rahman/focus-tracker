@@ -33,6 +33,7 @@ final class Settings {
         static let dwellDelay = "dwellDelay"
         static let showsGazeDot = "showsGazeDot"
         static let usesMouseAsGaze = "usesMouseAsGaze"
+        static let learnsFromClicks = "learnsFromClicks"
         static let cameraID = "cameraID"
     }
 
@@ -65,47 +66,57 @@ final class Settings {
         set { defaults.set(newValue, forKey: Key.usesMouseAsGaze) }
     }
 
+    /// Whether mouse clicks are used as calibration samples (the user looks where they click).
+    var learnsFromClicks: Bool {
+        get { defaults.object(forKey: Key.learnsFromClicks) as? Bool ?? true }
+        set { defaults.set(newValue, forKey: Key.learnsFromClicks) }
+    }
+
     var cameraID: String? {
         get { defaults.string(forKey: Key.cameraID) }
         set { defaults.set(newValue, forKey: Key.cameraID) }
     }
 }
 
-/// A fitted gaze model plus how well it did during validation.
-struct CalibrationRecord: Codable {
-    var model: GazeModel
-    /// Mean distance, in points, between predicted and actual validation targets.
-    var meanError: Double
-    var date: Date
-}
-
-/// Loads and saves the calibration under `~/Library/Application Support/FocusTracker`.
-enum CalibrationStore {
+/// Loads and saves what has been learned about the user's gaze, under
+/// `~/Library/Application Support/FocusTracker`.
+enum GazeProfileStore {
     private static var fileURL: URL {
         URL.applicationSupportDirectory
             .appending(path: "FocusTracker", directoryHint: .isDirectory)
-            .appending(path: "calibration.json")
+            .appending(path: "gaze-profile.json")
     }
 
-    static func load() -> CalibrationRecord? {
+    /// Just enough of a stored profile to tell which format it was saved in.
+    private struct Header: Decodable {
+        var formatVersion: Int?
+    }
+
+    static func load() -> SelfCalibration? {
         do {
-            return try JSONDecoder().decode(CalibrationRecord.self, from: Data(contentsOf: fileURL))
+            let data = try Data(contentsOf: fileURL)
+            let version = try JSONDecoder().decode(Header.self, from: data).formatVersion ?? 1
+            guard version == SelfCalibration.currentFormatVersion else {
+                Logger.calibration.info("Discarding gaze profile saved in format \(version); starting from the defaults")
+                return nil
+            }
+            return try JSONDecoder().decode(SelfCalibration.self, from: data)
         } catch CocoaError.fileReadNoSuchFile {
             return nil
         } catch {
-            Logger.calibration.error("Could not load calibration: \(error.localizedDescription, privacy: .public)")
+            Logger.calibration.error("Could not load gaze profile: \(error.localizedDescription, privacy: .public)")
             return nil
         }
     }
 
-    static func save(_ record: CalibrationRecord) {
+    static func save(_ calibration: SelfCalibration) {
         do {
             try FileManager.default.createDirectory(
                 at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true
             )
-            try JSONEncoder().encode(record).write(to: fileURL, options: .atomic)
+            try JSONEncoder().encode(calibration).write(to: fileURL, options: .atomic)
         } catch {
-            Logger.calibration.error("Could not save calibration: \(error.localizedDescription, privacy: .public)")
+            Logger.calibration.error("Could not save gaze profile: \(error.localizedDescription, privacy: .public)")
         }
     }
 }
@@ -114,6 +125,18 @@ enum ScreenGeometry {
     /// Bounds of the main display in global Quartz coordinates (top-left origin, points).
     static var mainDisplayBounds: CGRect {
         CGDisplayBounds(CGMainDisplayID())
+    }
+
+    /// The physical setup of the main display, assuming the camera sits centered above it.
+    static var gazeGeometry: GazeGeometry {
+        let frame = mainDisplayBounds
+        var size = CGDisplayScreenSize(CGMainDisplayID())
+        if size.width <= 0 || size.height <= 0 {
+            // Some displays don't report their size; assume about 100 points per inch.
+            let millimetersPerPoint = 25.4 / 100
+            size = CGSize(width: frame.width * millimetersPerPoint, height: frame.height * millimetersPerPoint)
+        }
+        return GazeGeometry(screenFrame: frame, screenSize: size)
     }
 
     /// Converts a global Quartz rect to Cocoa coordinates (bottom-left origin of the main display).
